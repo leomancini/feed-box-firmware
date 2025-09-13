@@ -9,8 +9,6 @@
 #include <hd44780ioClass/hd44780_I2Cexp.h>
 #include "config.h"
 
-// Configuration moved to config.h
-
 hd44780_I2Cexp lcd;
 
 // Web server and DNS server for AP mode
