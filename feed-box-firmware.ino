@@ -7,8 +7,6 @@
 #include <Wire.h>
 #include <hd44780.h>                      
 #include <hd44780ioClass/hd44780_I2Cexp.h>
-#include <FS.h>
-#include <LittleFS.h>
 #include "config.h"
 
 hd44780_I2Cexp lcd;
@@ -193,41 +191,6 @@ void performFactoryReset() {
   Serial.println("Factory reset complete - entering AP mode");
 }
 
-// ==== HTML FILE READING FUNCTIONS ====
-String readHTMLFile(String filename) {
-  if (!LittleFS.begin()) {
-    Serial.println("LittleFS mount failed!");
-    return "";
-  }
-  
-  if (!LittleFS.exists("/" + filename)) {
-    Serial.println("HTML file not found: " + filename);
-    LittleFS.end();
-    return "";
-  }
-  
-  File file = LittleFS.open("/" + filename, "r");
-  if (!file) {
-    Serial.println("Failed to open HTML file: " + filename);
-    LittleFS.end();
-    return "";
-  }
-  
-  String content = file.readString();
-  file.close();
-  LittleFS.end();
-  
-  Serial.println("Loaded HTML file: " + filename + " (" + String(content.length()) + " bytes)");
-  return content;
-}
-
-String readHTMLFileWithPlaceholder(String filename, String placeholder, String replacement) {
-  String content = readHTMLFile(filename);
-  if (content.length() > 0) {
-    content.replace(placeholder, replacement);
-  }
-  return content;
-}
 
 // ==== WEB SERVER HANDLERS ====
 void handleRoot() {
@@ -236,12 +199,39 @@ void handleRoot() {
   server.sendHeader("Pragma", "no-cache");
   server.sendHeader("Expires", "-1");
   
-  String html = readHTMLFile("setup.html");
-  
-  if (html.length() == 0) {
-    server.send(404, "text/plain", "Setup page not found");
-    return;
-  }
+  String html = "<!DOCTYPE html>"
+                "<html>"
+                "<head>"
+                "<title>FeedBox WiFi Setup</title>"
+                "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />"
+                "<style>"
+                "body{font-family:Arial,sans-serif;margin:40px;background:#f0f0f0;}"
+                ".container{max-width:400px;margin:0 auto;background:white;padding:20px;border-radius:8px;box-shadow:0 2px 10px rgba(0,0,0,0.1);}"
+                "h1{color:#333;text-align:center;margin-bottom:30px;}"
+                "input[type=\"text\"],input[type=\"password\"]{width:100%;padding:12px;margin:8px 0;box-sizing:border-box;border:2px solid #ddd;border-radius:4px;}"
+                "input[type=\"submit\"]{background:#007cba;color:white;padding:14px 20px;margin:8px 0;border:none;border-radius:4px;cursor:pointer;width:100%;font-size:16px;}"
+                "input[type=\"submit\"]:hover{background:#005a87;}"
+                ".status{padding:10px;margin:10px 0;border-radius:4px;text-align:center;}"
+                ".info{background:#e7f3ff;color:#0056b3;border:1px solid #b6d4fe;}"
+                "label{display:block;margin-top:15px;margin-bottom:5px;color:#333;font-weight:bold;}"
+                ".footer-text{text-align:center;color:#666;font-size:14px;margin-top:20px;}"
+                "</style>"
+                "</head>"
+                "<body>"
+                "<div class=\"container\">"
+                "<h1>🔗 FeedBox Setup</h1>"
+                "<div class=\"status info\">Connect to your WiFi network to continue setup</div>"
+                "<form action=\"/save\" method=\"post\">"
+                "<label for=\"ssid\">WiFi Network Name (SSID):</label>"
+                "<input type=\"text\" id=\"ssid\" name=\"ssid\" required placeholder=\"Enter network name\" />"
+                "<label for=\"password\">WiFi Password:</label>"
+                "<input type=\"password\" id=\"password\" name=\"password\" required placeholder=\"Enter password\" />"
+                "<input type=\"submit\" value=\"Save & Connect\" />"
+                "</form>"
+                "<p class=\"footer-text\">Device will restart and connect to your network</p>"
+                "</div>"
+                "</body>"
+                "</html>";
   
   server.send(200, "text/html", html);
 }
@@ -284,12 +274,31 @@ void handleSave() {
   if (ssid.length() > 0) {
     saveWiFiCredentials(ssid, password);
     
-    String html = readHTMLFile("success.html");
-    
-    if (html.length() == 0) {
-      server.send(404, "text/plain", "Success page not found");
-      return;
-    }
+    String html = "<!DOCTYPE html>"
+                  "<html>"
+                  "<head>"
+                  "<title>FeedBox WiFi Setup</title>"
+                  "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />"
+                  "<meta http-equiv=\"refresh\" content=\"10;url=/\" />"
+                  "<style>"
+                  "body{font-family:Arial,sans-serif;margin:40px;background:#f0f0f0;text-align:center;}"
+                  ".container{max-width:400px;margin:0 auto;background:white;padding:20px;border-radius:8px;box-shadow:0 2px 10px rgba(0,0,0,0.1);}"
+                  "h1{color:#333;margin-bottom:30px;}"
+                  ".success{background:#d4edda;color:#155724;border:1px solid #c3e6cb;padding:15px;border-radius:4px;margin:20px 0;}"
+                  ".spinner{border:4px solid #f3f3f3;border-top:4px solid #007cba;border-radius:50%;width:40px;height:40px;animation:spin 2s linear infinite;margin:20px auto;}"
+                  "@keyframes spin{0%{transform:rotate(0deg);}100%{transform:rotate(360deg);}}"
+                  ".footer-text{color:#666;font-size:14px;margin-top:20px;}"
+                  "</style>"
+                  "</head>"
+                  "<body>"
+                  "<div class=\"container\">"
+                  "<h1>✅ Settings Saved!</h1>"
+                  "<div class=\"success\">WiFi credentials have been saved.<br />Device will restart in a few seconds...</div>"
+                  "<div class=\"spinner\"></div>"
+                  "<p class=\"footer-text\">If connection fails, the device will return to setup mode.</p>"
+                  "</div>"
+                  "</body>"
+                  "</html>";
     
     server.send(200, "text/html", html);
     
@@ -313,29 +322,36 @@ void handleNotFound() {
   server.sendHeader("Pragma", "no-cache");
   server.sendHeader("Expires", "-1");
   
-  String html = readHTMLFileWithPlaceholder("redirect.html", "REDIRECT_URL", redirectURL);
-  
-  if (html.length() == 0) {
-    server.send(404, "text/plain", "Redirect page not found");
-    return;
-  }
+  String html = "<!DOCTYPE html>"
+                "<html>"
+                "<head>"
+                "<title>FeedBox Setup</title>"
+                "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />"
+                "<meta http-equiv=\"refresh\" content=\"0;url=" + redirectURL + "\" />"
+                "<style>"
+                "body{font-family:Arial,sans-serif;margin:40px;background:#f0f0f0;text-align:center;}"
+                ".container{max-width:400px;margin:0 auto;background:white;padding:20px;border-radius:8px;box-shadow:0 2px 10px rgba(0,0,0,0.1);}"
+                "h1{color:#333;margin-bottom:30px;}"
+                ".redirect-info{background:#e7f3ff;color:#0056b3;border:1px solid #b6d4fe;padding:15px;border-radius:4px;margin:20px 0;}"
+                ".spinner{border:4px solid #f3f3f3;border-top:4px solid #007cba;border-radius:50%;width:40px;height:40px;animation:spin 2s linear infinite;margin:20px auto;}"
+                "@keyframes spin{0%{transform:rotate(0deg);}100%{transform:rotate(360deg);}}"
+                ".manual-link{display:inline-block;background:#007cba;color:white;padding:12px 20px;text-decoration:none;border-radius:4px;margin-top:20px;}"
+                ".manual-link:hover{background:#005a87;}"
+                ".footer-text{color:#666;font-size:14px;margin-top:20px;}"
+                "</style>"
+                "</head>"
+                "<body>"
+                "<div class=\"container\">"
+                "<h1>🔗 Redirecting to FeedBox Setup...</h1>"
+                "<div class=\"redirect-info\">You're being redirected to the WiFi setup page automatically.</div>"
+                "<div class=\"spinner\"></div>"
+                "<p class=\"footer-text\">If you are not redirected automatically:<br /><a href=\"" + redirectURL + "\" class=\"manual-link\">Click here to continue</a></p>"
+                "</div>"
+                "<script>window.location.href='" + redirectURL + "';</script>"
+                "</body>"
+                "</html>";
   
   server.send(302, "text/html", html);
-}
-
-void handleCSS() {
-  // Add appropriate headers for CSS file
-  server.sendHeader("Cache-Control", "public, max-age=31536000"); // Cache for 1 year
-  server.sendHeader("Content-Type", "text/css");
-  
-  String css = readHTMLFile("styles.css");
-  
-  if (css.length() == 0) {
-    server.send(404, "text/plain", "CSS file not found");
-    return;
-  }
-  
-  server.send(200, "text/css", css);
 }
 
 void setup() {
@@ -423,9 +439,9 @@ void startAPMode() {
   WiFi.softAP(AP_SSID, AP_PASSWORD);
   
   lcd.clear();
-  lcd.print("WiFi Setup Mode");
+  lcd.print("Setup Mode");
   lcd.setCursor(0, 1);
-  lcd.print("Network: ");
+  lcd.print("Connect your phone to the network");
   lcd.print(AP_SSID);
   lcd.setCursor(0, 2);
   lcd.print("Open Network (no pwd)");
@@ -445,7 +461,6 @@ void startAPMode() {
   // Set up web server routes
   server.on("/", handleRoot);
   server.on("/save", HTTP_POST, handleSave);
-  server.on("/styles.css", HTTP_GET, handleCSS);
   
   // Captive portal detection routes for different operating systems
   server.on("/generate_204", handleCaptivePortalDetect); // Android captive portal detection
