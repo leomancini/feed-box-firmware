@@ -11,8 +11,8 @@ const char* API_BASE_URL = "http://feed-box-api.noshado.ws/devices/";
 // AP MODE CONFIGURATION
 const char* AP_SSID = "FeedBox-Setup";
 const char* AP_PASSWORD = ""; // Open network (no password)
-const IPAddress AP_IP(192, 168, 4, 1);
-const IPAddress AP_GATEWAY(192, 168, 4, 1);
+const IPAddress AP_IP(192, 168, 1, 1);
+const IPAddress AP_GATEWAY(192, 168, 1, 1);
 const IPAddress AP_SUBNET(255, 255, 255, 0);
 const int WEB_SERVER_PORT = 80;
 

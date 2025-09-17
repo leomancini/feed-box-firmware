@@ -1,3 +1,32 @@
+/*
+ * FeedBox Firmware - iOS-Compatible Captive Portal Version
+ * 
+ * Features:
+ * - iOS-friendly captive portal with embedded HTML (no file system needed)
+ * - EEPROM credential storage 
+ * - Clean black & white flat UI design
+ * - Complete captive portal redirect handling optimized for iOS
+ * - Double-tap reset for factory reset
+ * - LCD status display integration
+ * - Friendly URLs (setup.wifi, feedbox.setup, etc.)
+ * 
+ * CRITICAL iOS COMPATIBILITY NOTES:
+ * - iOS will NOT show captive portal if ANY response contains the word "Success"  
+ * - Captive portal DETECTION URLs (/generate_204, /hotspot-detect.html, etc.) must
+ *   return 200 responses with the actual captive portal content to trigger splash page
+ * - Random URLs (google.com, facebook.com, etc.) should get 302 redirects to captive portal
+ * - Only specific URLs (like success.txt) should return plain 200 OK responses
+ * - iOS CACHES WiFi networks! It only shows captive portal on "new" networks
+ * - SOLUTION: Append random 4-digit code to WiFi name each boot (FeedBox-Setup-1234)
+ *   This makes iOS think it's always connecting to a new network = captive portal every time!
+ * 
+ * Benefits:
+ * - Works reliably on ALL devices, especially iPhone/iPad
+ * - Self-contained firmware (HTML embedded in code)
+ * - Fast loading with minimal CSS
+ * - Easy deployment and updates
+ */
+
 #include <ESP8266WiFi.h>
 #include <ESP8266HTTPClient.h>
 #include <ESP8266WebServer.h>
@@ -11,14 +40,17 @@
 
 hd44780_I2Cexp lcd;
 
-// Web server and DNS server for AP mode
-ESP8266WebServer server(WEB_SERVER_PORT);
+// Web server and DNS server for captive portal
+ESP8266WebServer server(80);
 DNSServer dnsServer;
 
 // WiFi credentials storage
 String wifiSSID = "";
 String wifiPassword = "";
 bool apMode = false;
+
+// Dynamic AP name with random code (makes iOS think it's always a "new" network)
+String dynamicAPName = "";
 
 // LCD dimensions defined in config.h
 
@@ -35,6 +67,247 @@ unsigned long lastFetch       = 0;
 // fetchInterval defined in config.h as FETCH_INTERVAL_MS
 
 String apiURL;
+
+// Function declarations
+void markBootTime();
+void clearResetFlag();
+bool checkDoubleTapReset();
+void performFactoryReset();
+void saveWiFiCredentials(String ssid, String password);
+bool loadWiFiCredentials();
+void clearWiFiCredentials();
+void handleRoot();
+void handleSave();
+void handleCaptivePortalDetect();
+void handleConnectTest();
+void handleHotspotDetect();
+void handleNotFound();
+void startAPMode();
+void fetchData();
+void showNextPage();
+void generateDynamicAPName();
+
+// Embedded HTML for captive portal - Simplified Black & White Flat Design
+const char INDEX_HTML[] PROGMEM = R"=====(
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta http-equiv="Cache-Control" content="no-store, no-cache, must-revalidate, max-age=0">
+  <meta http-equiv="Pragma" content="no-cache">
+  <meta http-equiv="Expires" content="0">
+  <title>FeedBox WiFi Setup</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: Arial, sans-serif;
+      background: white;
+      color: black;
+      padding: 20px;
+      line-height: 1.4;
+    }
+    .container {
+      max-width: 400px;
+      margin: 0 auto;
+    }
+    h1 {
+      text-align: center;
+      margin-bottom: 30px;
+      font-size: 24px;
+      border-bottom: 2px solid black;
+      padding-bottom: 10px;
+    }
+    .form-group {
+      margin-bottom: 20px;
+    }
+    label {
+      display: block;
+      margin-bottom: 5px;
+      font-weight: bold;
+    }
+    input[type="text"], input[type="password"] {
+      width: 100%;
+      padding: 12px;
+      border: 2px solid black;
+      background: white;
+      font-size: 16px;
+    }
+    input[type="text"]:focus, input[type="password"]:focus {
+      outline: none;
+      border-color: #666;
+    }
+    .btn {
+      width: 100%;
+      padding: 15px;
+      background: black;
+      color: white;
+      border: none;
+      font-size: 16px;
+      font-weight: bold;
+      cursor: pointer;
+      margin-top: 10px;
+    }
+    .btn:hover {
+      background: #333;
+    }
+    .info {
+      text-align: center;
+      margin-top: 20px;
+      padding: 15px;
+      border: 1px solid black;
+      font-size: 14px;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>FeedBox WiFi Setup</h1>
+    
+    <form method="POST" action="/save">
+      <div class="form-group">
+        <label for="ssid">WiFi Network Name</label>
+        <input type="text" id="ssid" name="ssid" required placeholder="Enter WiFi network name">
+      </div>
+
+      <div class="form-group">
+        <label for="password">WiFi Password</label>
+        <input type="password" id="password" name="password" required placeholder="Enter WiFi password">
+      </div>
+
+      <button type="submit" class="btn">Save & Connect</button>
+    </form>
+
+    <div class="info">
+      Your FeedBox will save these credentials and restart to connect automatically.
+    </div>
+    
+    <div class="info" style="margin-top: 10px; font-size: 12px; color: #666;">
+      <strong>Easy URLs for this page:</strong><br>
+      setup.wifi • feedbox.setup • setup.local<br><br>
+      <strong>iPhone users:</strong> If above URLs don't work, try:<br>
+      <strong>http://192.168.1.1</strong><br><br>
+      <em>Note: WiFi network name has random numbers to ensure reliable setup on all devices.</em>
+    </div>
+  </div>
+</body>
+</html>
+)=====";
+
+const char COMPLETE_HTML[] PROGMEM = R"=====(
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>WiFi Setup Complete</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: Arial, sans-serif;
+      background: white;
+      color: black;
+      padding: 20px;
+      text-align: center;
+      height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    .container {
+      max-width: 400px;
+      border: 2px solid black;
+      padding: 40px 20px;
+    }
+    h1 {
+      font-size: 24px;
+      margin-bottom: 20px;
+    }
+    .checkmark {
+      font-size: 48px;
+      margin-bottom: 20px;
+    }
+    p {
+      margin-bottom: 15px;
+      line-height: 1.5;
+    }
+    .small {
+      font-size: 14px;
+      color: #666;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="checkmark">✓</div>
+    <h1>Setup Complete!</h1>
+    <p>WiFi credentials have been saved and your FeedBox is connecting.</p>
+    <p class="small">The device will restart automatically and connect to your network.</p>
+  </div>
+</body>
+</html>
+)=====";
+
+const char ERROR_HTML[] PROGMEM = R"=====(
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>WiFi Setup Error</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: Arial, sans-serif;
+      background: white;
+      color: black;
+      padding: 20px;
+      text-align: center;
+      height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    .container {
+      max-width: 400px;
+      border: 2px solid black;
+      padding: 40px 20px;
+    }
+    h1 {
+      font-size: 24px;
+      margin-bottom: 20px;
+    }
+    .error-icon {
+      font-size: 48px;
+      margin-bottom: 20px;
+    }
+    p {
+      margin-bottom: 15px;
+      line-height: 1.5;
+    }
+    .small {
+      font-size: 14px;
+      color: #666;
+    }
+    a {
+      color: black;
+      text-decoration: underline;
+    }
+    a:hover {
+      text-decoration: none;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="error-icon">✗</div>
+    <h1>Setup Error</h1>
+    <p>Could not save WiFi settings. Please check that all fields are filled in correctly.</p>
+    <p class="small"><a href="/">Go back to setup</a> and try again.</p>
+  </div>
+</body>
+</html>
+)=====";
 
 // ==== CREDENTIAL STORAGE FUNCTIONS ====
 void saveWiFiCredentials(String ssid, String password) {
@@ -191,80 +464,30 @@ void performFactoryReset() {
   Serial.println("Factory reset complete - entering AP mode");
 }
 
+void generateDynamicAPName() {
+  // Generate a random 4-digit code (1000-9999) to make iOS think it's a "new" network
+  // This forces iOS to show the captive portal every time instead of caching the network
+  randomSeed(millis() + ESP.getCycleCount()); // Better randomization
+  int randomCode = random(1000, 10000); // 1000-9999
+  
+  dynamicAPName = String(AP_SSID) + "-" + String(randomCode);
+  
+  Serial.println("Generated dynamic AP name: " + dynamicAPName);
+  Serial.println("Random code: " + String(randomCode) + " (forces iOS to see as 'new' network)");
+}
+
 
 // ==== WEB SERVER HANDLERS ====
 void handleRoot() {
+  Serial.println("=== SETUP PAGE REQUEST ===");
+  Serial.println("Serving embedded setup page to client");
+  
   // Add captive portal detection headers
   server.sendHeader("Cache-Control", "no-cache, no-store, must-revalidate");
   server.sendHeader("Pragma", "no-cache");
   server.sendHeader("Expires", "-1");
   
-  String html = "<!DOCTYPE html>"
-                "<html>"
-                "<head>"
-                "<title>FeedBox WiFi Setup</title>"
-                "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />"
-                "<style>"
-                "body{font-family:Arial,sans-serif;margin:40px;background:#f0f0f0;}"
-                ".container{max-width:400px;margin:0 auto;background:white;padding:20px;border-radius:8px;box-shadow:0 2px 10px rgba(0,0,0,0.1);}"
-                "h1{color:#333;text-align:center;margin-bottom:30px;}"
-                "input[type=\"text\"],input[type=\"password\"]{width:100%;padding:12px;margin:8px 0;box-sizing:border-box;border:2px solid #ddd;border-radius:4px;}"
-                "input[type=\"submit\"]{background:#007cba;color:white;padding:14px 20px;margin:8px 0;border:none;border-radius:4px;cursor:pointer;width:100%;font-size:16px;}"
-                "input[type=\"submit\"]:hover{background:#005a87;}"
-                ".status{padding:10px;margin:10px 0;border-radius:4px;text-align:center;}"
-                ".info{background:#e7f3ff;color:#0056b3;border:1px solid #b6d4fe;}"
-                "label{display:block;margin-top:15px;margin-bottom:5px;color:#333;font-weight:bold;}"
-                ".footer-text{text-align:center;color:#666;font-size:14px;margin-top:20px;}"
-                "</style>"
-                "</head>"
-                "<body>"
-                "<div class=\"container\">"
-                "<h1>🔗 FeedBox Setup</h1>"
-                "<div class=\"status info\">Connect to your WiFi network to continue setup</div>"
-                "<form action=\"/save\" method=\"post\">"
-                "<label for=\"ssid\">WiFi Network Name (SSID):</label>"
-                "<input type=\"text\" id=\"ssid\" name=\"ssid\" required placeholder=\"Enter network name\" />"
-                "<label for=\"password\">WiFi Password:</label>"
-                "<input type=\"password\" id=\"password\" name=\"password\" required placeholder=\"Enter password\" />"
-                "<input type=\"submit\" value=\"Save & Connect\" />"
-                "</form>"
-                "<p class=\"footer-text\">Device will restart and connect to your network</p>"
-                "</div>"
-                "</body>"
-                "</html>";
-  
-  server.send(200, "text/html", html);
-}
-
-// ==== CAPTIVE PORTAL DETECTION HANDLERS ====
-void handleCaptivePortalDetect() {
-  // Respond to various captive portal detection requests
-  // This triggers the captive portal popup on most devices
-  server.sendHeader("Cache-Control", "no-cache, no-store, must-revalidate");
-  server.sendHeader("Pragma", "no-cache");
-  server.sendHeader("Expires", "-1");
-  server.send(204, "text/plain", ""); // No content response triggers captive portal
-}
-
-void handleConnectTest() {
-  // Windows captive portal detection
-  server.sendHeader("Cache-Control", "no-cache, no-store, must-revalidate");
-  server.sendHeader("Pragma", "no-cache");
-  server.sendHeader("Expires", "-1");
-  server.send(200, "text/plain", "Microsoft Connect Test");
-}
-
-void handleHotspotDetect() {
-  // Apple captive portal detection - redirect to setup page
-  String redirectURL = "http://" + AP_IP.toString() + "/";
-  server.sendHeader("Location", redirectURL);
-  server.sendHeader("Cache-Control", "no-cache, no-store, must-revalidate");
-  server.sendHeader("Pragma", "no-cache");
-  server.sendHeader("Expires", "-1");
-  server.send(302, "text/html", 
-              "<!DOCTYPE html><html><head><title>Setup</title></head>"
-              "<body><h1>Redirecting to FeedBox Setup</h1>"
-              "<script>window.location.href='" + redirectURL + "';</script></body></html>");
+  server.send_P(200, "text/html", INDEX_HTML);
 }
 
 void handleSave() {
@@ -273,85 +496,76 @@ void handleSave() {
   
   if (ssid.length() > 0) {
     saveWiFiCredentials(ssid, password);
-    
-    String html = "<!DOCTYPE html>"
-                  "<html>"
-                  "<head>"
-                  "<title>FeedBox WiFi Setup</title>"
-                  "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />"
-                  "<meta http-equiv=\"refresh\" content=\"10;url=/\" />"
-                  "<style>"
-                  "body{font-family:Arial,sans-serif;margin:40px;background:#f0f0f0;text-align:center;}"
-                  ".container{max-width:400px;margin:0 auto;background:white;padding:20px;border-radius:8px;box-shadow:0 2px 10px rgba(0,0,0,0.1);}"
-                  "h1{color:#333;margin-bottom:30px;}"
-                  ".success{background:#d4edda;color:#155724;border:1px solid #c3e6cb;padding:15px;border-radius:4px;margin:20px 0;}"
-                  ".spinner{border:4px solid #f3f3f3;border-top:4px solid #007cba;border-radius:50%;width:40px;height:40px;animation:spin 2s linear infinite;margin:20px auto;}"
-                  "@keyframes spin{0%{transform:rotate(0deg);}100%{transform:rotate(360deg);}}"
-                  ".footer-text{color:#666;font-size:14px;margin-top:20px;}"
-                  "</style>"
-                  "</head>"
-                  "<body>"
-                  "<div class=\"container\">"
-                  "<h1>✅ Settings Saved!</h1>"
-                  "<div class=\"success\">WiFi credentials have been saved.<br />Device will restart in a few seconds...</div>"
-                  "<div class=\"spinner\"></div>"
-                  "<p class=\"footer-text\">If connection fails, the device will return to setup mode.</p>"
-                  "</div>"
-                  "</body>"
-                  "</html>";
-    
-    server.send(200, "text/html", html);
+    server.send_P(200, "text/html", COMPLETE_HTML);
     
     delay(2000);
     ESP.restart();
   } else {
-    server.send(400, "text/html", "Invalid SSID");
+    server.send_P(400, "text/html", ERROR_HTML);
   }
 }
 
-void handleNotFound() {
-  // Complete captive portal behavior - redirect ALL requests to setup page
-  String requestedURL = "http://" + server.hostHeader() + server.uri();
-  String redirectURL = "http://" + AP_IP.toString() + "/";
+// ==== CAPTIVE PORTAL DETECTION HANDLERS ====
+// CRITICAL: iOS captive portal detection URLs must return 200 responses with content
+// to trigger the splash page, NOT 302 redirects!
+void handleCaptivePortalDetect() {
+  Serial.println("Android/Google captive portal detect - returning captive portal page");
   
-  Serial.println("Captive portal redirect: " + requestedURL + " -> " + redirectURL);
-  
-  // Always redirect to setup page, regardless of host or path
-  server.sendHeader("Location", redirectURL);
   server.sendHeader("Cache-Control", "no-cache, no-store, must-revalidate");
   server.sendHeader("Pragma", "no-cache");
   server.sendHeader("Expires", "-1");
   
-  String html = "<!DOCTYPE html>"
-                "<html>"
-                "<head>"
-                "<title>FeedBox Setup</title>"
-                "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />"
-                "<meta http-equiv=\"refresh\" content=\"0;url=" + redirectURL + "\" />"
-                "<style>"
-                "body{font-family:Arial,sans-serif;margin:40px;background:#f0f0f0;text-align:center;}"
-                ".container{max-width:400px;margin:0 auto;background:white;padding:20px;border-radius:8px;box-shadow:0 2px 10px rgba(0,0,0,0.1);}"
-                "h1{color:#333;margin-bottom:30px;}"
-                ".redirect-info{background:#e7f3ff;color:#0056b3;border:1px solid #b6d4fe;padding:15px;border-radius:4px;margin:20px 0;}"
-                ".spinner{border:4px solid #f3f3f3;border-top:4px solid #007cba;border-radius:50%;width:40px;height:40px;animation:spin 2s linear infinite;margin:20px auto;}"
-                "@keyframes spin{0%{transform:rotate(0deg);}100%{transform:rotate(360deg);}}"
-                ".manual-link{display:inline-block;background:#007cba;color:white;padding:12px 20px;text-decoration:none;border-radius:4px;margin-top:20px;}"
-                ".manual-link:hover{background:#005a87;}"
-                ".footer-text{color:#666;font-size:14px;margin-top:20px;}"
-                "</style>"
-                "</head>"
-                "<body>"
-                "<div class=\"container\">"
-                "<h1>🔗 Redirecting to FeedBox Setup...</h1>"
-                "<div class=\"redirect-info\">You're being redirected to the WiFi setup page automatically.</div>"
-                "<div class=\"spinner\"></div>"
-                "<p class=\"footer-text\">If you are not redirected automatically:<br /><a href=\"" + redirectURL + "\" class=\"manual-link\">Click here to continue</a></p>"
-                "</div>"
-                "<script>window.location.href='" + redirectURL + "';</script>"
-                "</body>"
-                "</html>";
+  // Return our setup page directly (200 response triggers captive portal detection)
+  server.send_P(200, "text/html", INDEX_HTML);
+}
+
+void handleConnectTest() {
+  Serial.println("Windows connect test - returning captive portal page");
   
-  server.send(302, "text/html", html);
+  server.sendHeader("Cache-Control", "no-cache, no-store, must-revalidate");
+  server.sendHeader("Pragma", "no-cache");
+  server.sendHeader("Expires", "-1");
+  
+  // Return our setup page directly (200 response triggers captive portal detection)
+  server.send_P(200, "text/html", INDEX_HTML);
+}
+
+void handleHotspotDetect() {
+  Serial.println("Apple/iOS hotspot detect - returning captive portal page");
+  
+  server.sendHeader("Cache-Control", "no-cache, no-store, must-revalidate");
+  server.sendHeader("Pragma", "no-cache");  
+  server.sendHeader("Expires", "-1");
+  
+  // Return our setup page directly (200 response triggers captive portal detection)
+  server.send_P(200, "text/html", INDEX_HTML);
+}
+
+void handleNotFound() {
+  String host = server.hostHeader();
+  String uri = server.uri();
+  String redirectURL = "http://" + AP_IP.toString() + "/";
+  
+  Serial.println("=== CAPTIVE PORTAL REQUEST ===");
+  Serial.println("Host: " + host + " | URI: " + uri);
+  Serial.println("Redirecting to: " + redirectURL);
+  Serial.println("==============================");
+  
+  // Check if this is already requesting our IP - if so, serve the page directly
+  if (host == AP_IP.toString() || host == "192.168.1.1") {
+    Serial.println("Request is already for our IP, serving setup page directly");
+    handleRoot();
+    return;
+  }
+  
+  // For random URLs (google.com, facebook.com, etc.), send 302 redirect to captive portal
+  // This is different from detection URLs which need 200 responses to trigger splash page
+  server.sendHeader("Location", redirectURL, true);
+  server.sendHeader("Cache-Control", "no-cache, no-store, must-revalidate");
+  server.sendHeader("Pragma", "no-cache"); 
+  server.sendHeader("Expires", "-1");
+  
+  server.send(302, "text/plain", "");  // Empty body for clean redirect
 }
 
 void setup() {
@@ -372,7 +586,7 @@ void setup() {
   // Check for double-tap reset (must be done early in boot process)
   if (checkDoubleTapReset()) {
     performFactoryReset();
-    // Force AP mode after factory reset
+    // Force AP mode after factory reset (startAPMode will generate new random name)
     startAPMode();
     return; // Exit setup, continue in AP mode
   }
@@ -434,33 +648,57 @@ void startAPMode() {
   Serial.println("Starting AP mode for WiFi configuration");
   apMode = true;
   
+  // Generate a unique AP name with random code for iOS captive portal detection
+  generateDynamicAPName();
+  
   WiFi.mode(WIFI_AP);
   WiFi.softAPConfig(AP_IP, AP_GATEWAY, AP_SUBNET);
-  WiFi.softAP(AP_SSID, AP_PASSWORD);
+  WiFi.softAP(dynamicAPName.c_str(), AP_PASSWORD); // Use dynamic name
   
   lcd.clear();
-  lcd.print("Setup Mode");
+  lcd.setCursor(0, 0);
+  lcd.print("WiFi Setup Mode");
   lcd.setCursor(0, 1);
-  lcd.print("Connect your phone to the network");
-  lcd.print(AP_SSID);
+  lcd.print("1.Connect to:");
   lcd.setCursor(0, 2);
-  lcd.print("Open Network (no pwd)");
+  // Truncate the name if it's too long for LCD (20 characters max)
+  String displayName = dynamicAPName;
+  if (displayName.length() > LCD_COLS) {
+    displayName = displayName.substring(0, LCD_COLS);
+  }
+  lcd.print(displayName);
   lcd.setCursor(0, 3);
-  lcd.print("IP: ");
-  lcd.print(AP_IP);
+  lcd.print("2.Go to setup.wifi");
   
   Serial.print("AP started. Connect to: ");
-  Serial.println(AP_SSID);
-  Serial.println("Open network (no password required)");
+  Serial.println(dynamicAPName);
   Serial.print("IP: ");
   Serial.println(AP_IP);
   
-  // Set up DNS server for captive portal
+  // Set up DNS server for captive portal - redirect ALL DNS queries to our IP
+  dnsServer.setTTL(0); // Don't cache DNS responses
   dnsServer.start(53, "*", AP_IP);
+  Serial.println("DNS server started - redirecting ALL domains to " + AP_IP.toString());
+  Serial.println("Users can access setup page with any of these URLs:");
+  Serial.println("  • setup.wifi");
+  Serial.println("  • feedbox.setup");  
+  Serial.println("  • setup.local");
+  Serial.println("  • wifi.setup");
+  Serial.println("  • go.setup");
+  Serial.println("  • Or any other domain name!");
   
-  // Set up web server routes
+  // Set up web server routes with embedded HTML
+  // CRITICAL iOS CAPTIVE PORTAL BEHAVIOR:
+  // - iOS will NOT show captive portal if ANY response contains the word "Success"
+  // - Captive portal DETECTION URLs must return 200 responses with content to trigger splash page
+  // - Random URLs (like google.com) should get 302 redirects to the captive portal  
+  // - Only specific URLs like success.txt should return plain 200 OK responses
+  
   server.on("/", handleRoot);
   server.on("/save", HTTP_POST, handleSave);
+  server.on("/test", [](){
+    server.send(200, "text/plain", "FeedBox test page works! AP IP: " + AP_IP.toString());
+  });
   
   // Captive portal detection routes for different operating systems
   server.on("/generate_204", handleCaptivePortalDetect); // Android captive portal detection
@@ -474,20 +712,87 @@ void startAPMode() {
   server.on("/ncsi.txt", handleConnectTest); // Windows NCSI detection
   server.on("/fwlink", handleHotspotDetect); // Microsoft redirect detection
   
-  // Catch-all for any unhandled requests
+  // Additional routes from best practices
+  server.on("/wpad.dat", [](){
+    server.send(404, "text/plain", "Not Found");
+  }); // Web Proxy Auto-Discovery - prevents Windows from panicking ESP32
+  
+  server.on("/canonical.html", handleHotspotDetect); // Ubuntu captive portal detection
+  
+  // CRITICAL: success.txt must return 200 OK, not redirect (Firefox expects this)
+  server.on("/success.txt", [](){
+    Serial.println("success.txt requested - returning 200 OK");
+    server.send(200, "text/plain", "OK"); // Note: avoid word "success" for iOS compatibility
+  });
+  
+  // Additional captive portal detection routes
+  server.on("/msftconnecttest.com/connecttest.txt", handleConnectTest); // Microsoft connectivity test
+  server.on("/msftncsi.com/ncsi.txt", handleConnectTest); // Microsoft NCSI
+  server.on("/www.msftconnecttest.com/connecttest.txt", handleConnectTest); // Microsoft with www
+  server.on("/ipv6.msftconnecttest.com/connecttest.txt", handleConnectTest); // Microsoft IPv6
+  server.on("/connectivitycheck.gstatic.com/generate_204", handleCaptivePortalDetect); // Google connectivity
+  server.on("/www.google.com/generate_204", handleCaptivePortalDetect); // Google alternative
+  server.on("/clients3.google.com/generate_204", handleCaptivePortalDetect); // Google clients
+  server.on("/connectivitycheck.android.com/generate_204", handleCaptivePortalDetect); // Android
+  server.on("/captive.apple.com", handleHotspotDetect); // Apple captive portal
+  server.on("/www.apple.com/library/test/success.html", handleHotspotDetect); // Apple test page
+  server.on("/gsp1.apple.com/pep/gcc", handleHotspotDetect); // Apple GeoServices captive portal
+  server.on("/gspe1.apple.com/pep/gcc", handleHotspotDetect); // Apple GeoServices alternative
+  server.on("/apple.com/library/test/success.html", handleHotspotDetect); // Apple without www
+  
+  // Favicon - return 404 to prevent errors
+  server.on("/favicon.ico", [](){
+    server.send(404, "text/plain", "Not Found");
+  });
+  
+  // Catch-all for any unhandled requests - this is the KEY for captive portal redirection
   server.onNotFound(handleNotFound);
   
   server.begin();
-  Serial.println("Web server started");
+  Serial.println("Web server started on port 80");
+  Serial.println("Captive portal is active with embedded HTML!");
+  Serial.println("Connect to '" + dynamicAPName + "' and visit:");
+  Serial.println("  • Any website (auto-redirect)");
+  Serial.println("  • setup.wifi (friendly URL)");
+  Serial.println("");
+  Serial.println("iOS CAPTIVE PORTAL TIP:");
+  Serial.println("The random code in the WiFi name forces iOS to show");
+  Serial.println("the captive portal every time (avoids network caching).");
 }
 
 void loop() {
   unsigned long now = millis();
   
   if (apMode) {
-    // Handle web server requests and DNS in AP mode
+    // Handle DNS and web server requests FREQUENTLY for good captive portal performance
     dnsServer.processNextRequest();
     server.handleClient();
+    
+    // Process DNS requests multiple times per loop iteration for better responsiveness
+    dnsServer.processNextRequest();
+    
+    // Debug: Show we're processing requests (with more frequent DNS debugging)
+    static unsigned long lastDebugPrint = 0;
+    static unsigned long lastDNSDebug = 0;
+    
+    if (now - lastDebugPrint > 30000) {
+      Serial.println("[DEBUG] AP Mode active - processing DNS and web requests...");
+      Serial.println("AP IP: " + AP_IP.toString() + " | SSID: " + dynamicAPName);
+      Serial.println("DNS Server active - redirecting all domains to our IP");
+      Serial.println("Random WiFi name ensures iOS sees this as a 'new' network");
+      Serial.println("If iPhone shows 'can't open page', try these steps:");
+      Serial.println("  1. Turn WiFi off/on");
+      Serial.println("  2. Try http://192.168.1.1 directly");
+      Serial.println("  3. Clear Safari cache");
+      Serial.println("  4. Try 'Forget Network' and reconnect");
+      lastDebugPrint = now;
+    }
+    
+    // More frequent DNS debugging for troubleshooting
+    if (now - lastDNSDebug > 5000) {
+      Serial.println("[DNS] Listening for DNS requests on port 53...");
+      lastDNSDebug = now;
+    }
     
     // Optional: Add timeout to retry connection attempt
     // This allows the device to periodically try connecting again
